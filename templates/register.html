@@ -7,9 +7,10 @@
     <h2 style="color: #667eea; margin-bottom: 1.5rem; text-align: center;">Create Account</h2>
     
     <form method="POST" action="{{ url_for('register') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
         <div class="form-group">
             <label for="username">Username</label>
-            <input type="text" id="username" name="username" required 
+            <input type="text" id="username" name="username" required
                    minlength="3" placeholder="Choose a username">
         </div>
         

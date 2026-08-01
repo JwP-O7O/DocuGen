@@ -4,16 +4,31 @@ DocuGen - Document Generation Application with User Authentication
 import os
 import secrets
 import re
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from io import BytesIO
-from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from flask_wtf.csrf import CSRFProtect
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_compress import Compress
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from functools import wraps
 
 # Import new PDF engine
 from pdf_generator import dispatch_pdf_generation
+
+# Import Sentry for error tracking (optional)
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+    SENTRY_AVAILABLE = True
+except ImportError:
+    SENTRY_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -29,7 +44,73 @@ else:
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///docugen.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# Database connection pooling configuration
+app.config['SQLALCHEMY_POOL_SIZE'] = 10
+app.config['SQLALCHEMY_POOL_TIMEOUT'] = 30
+app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600
+app.config['SQLALCHEMY_MAX_OVERFLOW'] = 20
+
+# Session security configuration
+app.config['SESSION_COOKIE_SECURE'] = not app.debug  # True in production (HTTPS only)
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+app.config['PERMANENT_SESSION_LIFETIME'] = 3600  # 1 hour session timeout
+
 db = SQLAlchemy(app)
+
+# Initialize Flask extensions
+migrate = Migrate(app, db)  # Database migrations
+csrf = CSRFProtect(app)  # CSRF protection
+compress = Compress(app)  # Response compression
+
+# Rate limiting (protect against brute force)
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+# Setup Sentry error tracking if configured
+if SENTRY_AVAILABLE and os.getenv('SENTRY_DSN'):
+    sentry_sdk.init(
+        dsn=os.getenv('SENTRY_DSN'),
+        integrations=[FlaskIntegration()],
+        traces_sample_rate=1.0,
+        environment=os.getenv('FLASK_ENV', 'production'),
+        release=os.getenv('APP_VERSION', 'unknown')
+    )
+    app.logger.info('Sentry error tracking initialized')
+
+# Setup logging
+def setup_logging(app):
+    """Configure application logging with rotation"""
+    if not app.debug:
+        # Create logs directory if it doesn't exist
+        if not os.path.exists('logs'):
+            os.mkdir('logs')
+
+        # File handler with rotation (10MB max, keep 10 backup files)
+        file_handler = RotatingFileHandler(
+            'logs/docugen.log',
+            maxBytes=10485760,
+            backupCount=10
+        )
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+        ))
+        file_handler.setLevel(logging.INFO)
+        app.logger.addHandler(file_handler)
+
+    # Console handler for all environments
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    app.logger.addHandler(console_handler)
+
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('DocuGen application startup')
+
+setup_logging(app)
 
 ALLOWED_DOC_TYPES = {'letter', 'invoice', 'report', 'receipt', 'general'}
 ALLOWED_AI_FILE_EXTENSIONS = {'txt', 'md'}
@@ -69,6 +150,13 @@ class Document(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
+    # Blockchain fields (Week 1-2)
+    blockchain_hash = db.Column(db.String(66))  # 0x + 64 hex chars (SHA-256)
+    blockchain_tx = db.Column(db.String(66))    # Transaction hash on blockchain
+    ipfs_cid = db.Column(db.String(100))        # IPFS Content Identifier
+    blockchain_verified = db.Column(db.Boolean, default=False)  # Registration status
+    blockchain_timestamp = db.Column(db.DateTime)  # When registered on blockchain
+
     def __repr__(self):
         return f'<Document {self.title}>'
 
@@ -87,6 +175,100 @@ def clean_text(value):
     # Remove non-printable/control characters but preserve tabs/newlines
     sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', normalized)
     return sanitized.strip()
+
+
+def validate_email(email):
+    """
+    Validate email format and length.
+
+    Args:
+        email: Email address to validate
+
+    Returns:
+        str: Normalized email (lowercase, trimmed)
+
+    Raises:
+        ValueError: If email is invalid
+    """
+    email = (email or '').strip().lower()
+
+    if not email:
+        raise ValueError("Email address is required")
+
+    if len(email) > 120:
+        raise ValueError("Email address is too long (max 120 characters)")
+
+    # Basic email regex pattern
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    if not email_pattern.match(email):
+        raise ValueError("Please enter a valid email address")
+
+    return email
+
+
+def validate_password(password):
+    """
+    Validate password strength.
+
+    Requirements:
+    - Minimum 8 characters
+    - At least one uppercase letter
+    - At least one lowercase letter
+    - At least one number
+
+    Args:
+        password: Password to validate
+
+    Raises:
+        ValueError: If password doesn't meet requirements
+    """
+    if not password:
+        raise ValueError("Password is required")
+
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long")
+
+    if not re.search(r'[A-Z]', password):
+        raise ValueError("Password must contain at least one uppercase letter")
+
+    if not re.search(r'[a-z]', password):
+        raise ValueError("Password must contain at least one lowercase letter")
+
+    if not re.search(r'[0-9]', password):
+        raise ValueError("Password must contain at least one number")
+
+    return True
+
+
+def validate_username(username):
+    """
+    Validate username format.
+
+    Args:
+        username: Username to validate
+
+    Returns:
+        str: Normalized username (trimmed)
+
+    Raises:
+        ValueError: If username is invalid
+    """
+    username = (username or '').strip()
+
+    if not username:
+        raise ValueError("Username is required")
+
+    if len(username) < 3:
+        raise ValueError("Username must be at least 3 characters long")
+
+    if len(username) > 80:
+        raise ValueError("Username is too long (max 80 characters)")
+
+    # Only allow alphanumeric and underscore
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        raise ValueError("Username can only contain letters, numbers, and underscores")
+
+    return username
 
 
 def load_text_from_upload(upload):
@@ -232,62 +414,74 @@ def register():
     """User registration"""
     if 'user_id' in session:
         return redirect(url_for('index'))
-    
+
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        email = request.form.get('email', '').strip()
-        password = request.form.get('password', '')
-        confirm_password = request.form.get('confirm_password', '')
+        try:
+            # Get form data
+            username_raw = request.form.get('username', '')
+            email_raw = request.form.get('email', '')
+            password = request.form.get('password', '')
+            confirm_password = request.form.get('confirm_password', '')
 
-        # Validation
-        if not username or not email or not password:
-            flash('All fields are required.', 'error')
+            # Validate and normalize inputs
+            username = validate_username(username_raw)
+            email = validate_email(email_raw)
+
+            # Validate password
+            validate_password(password)
+
+            # Check password confirmation
+            if password != confirm_password:
+                flash('Passwords do not match.', 'error')
+                return render_template('register.html')
+
+            # Check if user already exists
+            if User.query.filter_by(username=username).first():
+                flash('Username already exists.', 'error')
+                app.logger.warning(f'Registration attempt with existing username: {username}')
+                return render_template('register.html')
+
+            if User.query.filter_by(email=email).first():
+                flash('Email already registered.', 'error')
+                app.logger.warning(f'Registration attempt with existing email: {email}')
+                return render_template('register.html')
+
+            # Create new user
+            user = User(username=username, email=email)
+            user.set_password(password)
+            db.session.add(user)
+            db.session.commit()
+
+            app.logger.info(f'New user registered: {username} ({email}) from {request.remote_addr}')
+            flash('Registration successful! Please log in.', 'success')
+            return redirect(url_for('login'))
+
+        except ValueError as e:
+            # Validation error - show user-friendly message
+            flash(str(e), 'error')
             return render_template('register.html')
-
-        if len(username) < 3:
-            flash('Username must be at least 3 characters long.', 'error')
+        except Exception as e:
+            # Unexpected error
+            app.logger.error(f'Registration error: {e}', exc_info=True)
+            flash('An error occurred during registration. Please try again.', 'error')
             return render_template('register.html')
-
-        if len(password) < 6:
-            flash('Password must be at least 6 characters long.', 'error')
-            return render_template('register.html')
-
-        if password != confirm_password:
-            flash('Passwords do not match.', 'error')
-            return render_template('register.html')
-
-        # Check if user exists
-        if User.query.filter_by(username=username).first():
-            flash('Username already exists.', 'error')
-            return render_template('register.html')
-
-        if User.query.filter_by(email=email).first():
-            flash('Email already registered.', 'error')
-            return render_template('register.html')
-
-        # Create new user
-        user = User(username=username, email=email)
-        user.set_password(password)
-        db.session.add(user)
-        db.session.commit()
-
-        flash('Registration successful! Please log in.', 'success')
-        return redirect(url_for('login'))
 
     return render_template('register.html')
 
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")  # Rate limiting: max 5 login attempts per minute
 def login():
     """User login"""
     if 'user_id' in session:
         return redirect(url_for('index'))
-    
+
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
 
         if not username or not password:
+            app.logger.warning(f'Login attempt with missing credentials from {request.remote_addr}')
             flash('Please provide both username and password.', 'error')
             return render_template('login.html')
 
@@ -296,9 +490,11 @@ def login():
         if user and user.check_password(password):
             session['user_id'] = user.id
             session['username'] = user.username
+            app.logger.info(f'User login successful: {username} from {request.remote_addr}')
             flash(f'Welcome back, {user.username}!', 'success')
             return redirect(url_for('index'))
         else:
+            app.logger.warning(f'Failed login attempt for username: {username} from {request.remote_addr}')
             flash('Invalid username or password.', 'error')
 
     return render_template('login.html')
@@ -309,9 +505,37 @@ def login():
 def logout():
     """User logout"""
     username = session.get('username', '')
+    app.logger.info(f'User logout: {username} from {request.remote_addr}')
     session.clear()
     flash(f'Goodbye, {username}!', 'info')
     return redirect(url_for('index'))
+
+
+@app.route('/health')
+@csrf.exempt  # Health checks don't need CSRF protection
+def health_check():
+    """
+    Health check endpoint for load balancers and monitoring.
+    Returns JSON with health status and basic system info.
+    """
+    try:
+        # Check database connection
+        db.session.execute(db.text('SELECT 1'))
+
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'timestamp': datetime.utcnow().isoformat(),
+            'version': os.getenv('APP_VERSION', 'unknown')
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f'Health check failed: {e}', exc_info=True)
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 503
 
 
 @app.route('/dashboard')
@@ -426,9 +650,17 @@ def download_document(doc_id):
 
     try:
         dispatch_pdf_generation(pdf_buffer, doc_proxy, user, bank_style=bank_style)
+    except ValueError as e:
+        app.logger.warning(f"Invalid document data for doc_id={doc_id}: {e}", exc_info=True)
+        flash(f"Invalid document data: {str(e)}", "error")
+        return redirect(url_for('dashboard'))
+    except IOError as e:
+        app.logger.error(f"PDF generation I/O error for doc_id={doc_id}: {e}", exc_info=True)
+        flash("Failed to generate PDF. Please try again later.", "error")
+        return redirect(url_for('dashboard'))
     except Exception as e:
-        app.logger.error(f"PDF Gen Error: {e}")
-        flash("Error generating PDF. Please contact support.", "error")
+        app.logger.critical(f"Unexpected PDF generation error for doc_id={doc_id}: {e}", exc_info=True)
+        flash("An unexpected error occurred. Support has been notified.", "error")
         return redirect(url_for('dashboard'))
     
     pdf_buffer.seek(0)

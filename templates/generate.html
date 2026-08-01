@@ -8,6 +8,7 @@
 
     <div class="glass-panel" style="padding: 2rem; max-width: 800px; margin: 0 auto;">
         <form method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
 
             <div class="form-group">
                 <label for="doc_type">Type Document</label>
